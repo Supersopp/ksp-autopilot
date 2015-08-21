@@ -19,18 +19,27 @@ if __name__ == "__main__":
     ned_rf = vessel.surface_reference_frame
     orbit_rf = vessel.orbit.body.reference_frame
     velocity_surface = connection.add_stream(connection.space_center.transform_velocity,vessel.position(orbit_rf),vessel.velocity(orbit_rf),orbit_rf,ned_rf)
+    latitude = connection.add_stream(getattr,vessel.flight(),'latitude')
+    longitude = connection.add_stream(getattr,vessel.flight(),'longitude')
     stage_1_resources = vessel.resources_in_decouple_stage(stage=1, cumulative=False)
     launcher_liquid_fuel = connection.add_stream(stage_1_resources.amount, 'LiquidFuel')
 
     altitude_pid       = pid_controller.PID(0.2,0.0,0.0,0.0,0.0)
     vertical_speed_pid = pid_controller.PID(0.2,1.0,0.0,1.0,0.0)
-    horizontal_speed_pid = pid_controller.PID(2.0,0.0,0.0,30.0,-30.0)
+    horizontal_speed_pid = pid_controller.PID(2.0,0.0,0.0,20.0,-20.0)
+    pos_latitude_pid = pid_controller.PID(500,0,0.0,0,0)
+    pos_longitude_pid = pid_controller.PID(500,0,0.0,0,0)
     altitude_target = 500
     vertical_speed_target = 0
 
     state = "INIT"
     loop_time = 0.1
     launch_site_altitude_ASL = altitude()
+    launch_site_latitude = latitude()
+    launch_site_longitude = longitude()
+    kerbin = connection.space_center.bodies['Kerbin']
+    launch_site_radius = 5/kerbin.equatorial_radius*360
+    
     dt = 0.0
 
     while running:
@@ -88,32 +97,44 @@ if __name__ == "__main__":
                 state = "ACENDING"
 
         elif state == "ACENDING":
-            altitude_target = 500.0
-            altitude_control = True
-            if altitude() > altitude_target - 5.0:
-                hover_time = time_now + 10.0
+            #altitude_target = 1000.0
+            #altitude_control = True
+            vertical_speed_control = True
+            vertical_speed_target = 220.0
+            if altitude() > 2000.0:
+                hover_time = time_now + 20.0
                 state = "HOVER"
         
         elif state == "HOVER":
-            altitude_target = 500.0
+            altitude_target = 3000.0
             altitude_control = True
             position_control = True
+            position_target = (launch_site_latitude,launch_site_longitude)
             if time_now > hover_time:
                 state = "DECENDING"
 
         elif state == "DECENDING":
-            vertical_speed_target = -0.2*(altitude_above_launch_site-5.0) - 1.0
+            vertical_speed_target = -0.1*(altitude_above_launch_site-20.0) - 1.0
             vertical_speed_control = True
             position_control = True
+            position_target = (launch_site_latitude,launch_site_longitude)
             spoiler_active = True
-            if altitude_above_launch_site < 5.0:
+            if altitude_above_launch_site < 20.0:
+                state = "FINE_TUNE_LANDING"
+
+        elif state == "FINE_TUNE_LANDING":
+            vertical_speed_target = 0.0
+            vertical_speed_control = True
+            position_control = True
+            position_target = (launch_site_latitude,launch_site_longitude)
+            if at_position_target:
                 state = "LANDING"
 
         elif state == "LANDING":
             vertical_speed_target = -1.0
             vertical_speed_control = True
-            horizntal_speed_control = True
-            horizontal_speed_target = (0.0,0.0)
+            position_control = True
+            position_target = (launch_site_latitude,launch_site_longitude)
             spoiler_active = True
             vessel.control.gear = True
             if vertical_speed > -0.1 and altitude_above_launch_site < 1:
@@ -141,28 +162,36 @@ if __name__ == "__main__":
 
 
         # PID control loop for altitude control.
-        if altitude_control and state != "INIT":
+        if altitude_control: 
             altitude_error = altitude_target - altitude()
             vertical_speed_target = altitude_pid.calculate_command(altitude_error,dt)
             vertical_speed_control = True
-            altitude_control = False
         else:
             altitude_pid.reset()
 
         # PID control loop for vertical speed control.
         throttle_command = 0.0
-        if vertical_speed_control and state != "INIT":
+        if vertical_speed_control: 
             vertical_speed_error = vertical_speed_target - vertical_speed
             throttle_command     = min(max(vertical_speed_pid.calculate_command(vertical_speed_error,dt),0.0),1.0) 
             vessel.control.throttle = throttle_command
-            vertical_speed_control == False
         else:
             vertical_speed_pid.reset()
         
         # Position control.
         if position_control:
-            horizontal_speed_target = (0.0, 0.0)
+            latitude_error = position_target[0]-latitude()
+            longitude_error = position_target[1]-longitude()
+            horizontal_speed_target = (pos_latitude_pid.calculate_command(latitude_error,dt),pos_longitude_pid.calculate_command(longitude_error,dt))
             horizontal_speed_control = True    
+            if math.sqrt(latitude_error*latitude_error+longitude_error*longitude_error) < launch_site_radius:
+                at_position_target = True
+            else:
+                at_position_target = False
+        else:
+            pos_latitude_pid.reset()
+            pos_longitude_pid.reset()
+            at_position_target = False
             
         # Horizontal speed control.
         if horizontal_speed_control:
@@ -172,7 +201,11 @@ if __name__ == "__main__":
             speed_east_error  = horizontal_speed_east_target - speed_east
             horizontal_speed_error_magnitude = math.sqrt(speed_north_error*speed_north_error+speed_east_error*speed_east_error)
             horizontal_speed_error_direction = 180.0*math.atan2(speed_east_error,speed_north_error)/math.pi
-            pitch = 90 -  min(max(horizontal_speed_pid.calculate_command(horizontal_speed_error_magnitude,dt),-30),30)
+            pitch_effort = min(max(horizontal_speed_pid.calculate_command(horizontal_speed_error_magnitude,dt),-45),45)
+            if throttle_command < 0.05 and vertical_speed < 0:
+                pitch = 90 + pitch_effort
+            else:
+                pitch = 90 - pitch_effort 
             heading = horizontal_speed_error_direction
             while heading < 0.0:
                 heading += 360.0
@@ -180,15 +213,15 @@ if __name__ == "__main__":
                 heading -= 360.0 
             vessel.auto_pilot.target_pitch_and_heading(pitch,heading)
             vessel.auto_pilot.engage()
-        horizontal_speed_control = False
+        else:
+            horizontal_speed_pid.reset()
 
 
         # Spoiler activation.
-        if spoiler_active and vertical_speed < -0.1: 
+        if spoiler_active and vertical_speed < -0.1 and throttle_command > 0.05: 
             vessel.control.toggle_action_group(1)
         else:
             vessel.control.toggle_action_group(2)
-        spoiler_activate = False
 
         # Check for abort condition.
         #if launcher_liquid_fuel() < 40.0:
@@ -210,6 +243,12 @@ if __name__ == "__main__":
             print("Velocity:              " + str(velocity_ned))
             if horizontal_speed_control:
                 print("Horizontal speed err:  " + str(horizontal_speed_error_magnitude) + "m/s " + str(horizontal_speed_error_direction) + "deg")
+
+        horizontal_speed_control = False
+        vertical_speed_control = False
+        altitude_control = False
+        position_control = False
+        spoiler_activate = False
 
         # Sleep for remainder of looptime.
         sleep_time = loop_time - (connection.space_center.ut - time_now)
