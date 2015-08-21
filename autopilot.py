@@ -8,27 +8,31 @@ if __name__ == "__main__":
     connection = krpc.connect(name="autopilot")
     vessel     = connection.space_center.active_vessel
     vessel_name = vessel.name
-    if vessel_name == "Cricketjumper MKI":
-        print("Connected to " + vessel_name)
-        running = True
-    else:
-        running = False
+    #if vessel_name == "Cricketjumper MKII":
+    #    print("Connected to " + vessel_name)
+    running = True
+    #else:
+    #    running = False
 
+    surface_velocity_frame = vessel.surface_velocity_reference_frame
+    surface_frame = vessel.surface_reference_frame
+    orbit_frame = vessel.orbit.body.reference_frame
+
+    velocity_surface = connection.add_stream(connection.space_center.transform_velocity,vessel.position(orbit_frame),vessel.velocity(orbit_frame),orbit_frame,surface_frame)
     altitude = connection.add_stream(getattr, vessel.flight(), 'mean_altitude')
     surface_altitude = connection.add_stream(getattr, vessel.flight(), 'surface_altitude')
-    ned_rf = vessel.surface_reference_frame
-    orbit_rf = vessel.orbit.body.reference_frame
-    velocity_surface = connection.add_stream(connection.space_center.transform_velocity,vessel.position(orbit_rf),vessel.velocity(orbit_rf),orbit_rf,ned_rf)
     latitude = connection.add_stream(getattr,vessel.flight(),'latitude')
     longitude = connection.add_stream(getattr,vessel.flight(),'longitude')
+
     stage_1_resources = vessel.resources_in_decouple_stage(stage=1, cumulative=False)
     launcher_liquid_fuel = connection.add_stream(stage_1_resources.amount, 'LiquidFuel')
 
     altitude_pid       = pid_controller.PID(0.2,0.0,0.0,0.0,0.0)
-    vertical_speed_pid = pid_controller.PID(0.2,1.0,0.0,1.0,0.0)
+    vertical_speed_pid = pid_controller.PID(0.2,2.0,0.0,1.0,0.0)
+    speed_pid = pid_controller.PID(0.2,0.0,0.0,1.0,0.0)
     horizontal_speed_pid = pid_controller.PID(2.0,0.0,0.0,20.0,-20.0)
-    pos_latitude_pid = pid_controller.PID(500,0,0.0,0,0)
-    pos_longitude_pid = pid_controller.PID(500,0,0.0,0,0)
+    pos_latitude_pid = pid_controller.PID(750,0,0.0,0,0)
+    pos_longitude_pid = pid_controller.PID(750,0,0.0,0,0)
     altitude_target = 500
     vertical_speed_target = 0
 
@@ -38,7 +42,8 @@ if __name__ == "__main__":
     launch_site_latitude = latitude()
     launch_site_longitude = longitude()
     kerbin = connection.space_center.bodies['Kerbin']
-    launch_site_radius = 5/kerbin.equatorial_radius*360
+    launch_site_radius = 10/(2*math.pi*kerbin.equatorial_radius)*360.0
+    landing_site_latlonalt = (latitude(),longitude(),altitude())
     
     dt = 0.0
 
@@ -55,6 +60,14 @@ if __name__ == "__main__":
         vertical_speed = -velocity_ned[2]
         speed_north    = velocity_ned[0]
         speed_east     = velocity_ned[1]
+
+        # Heading to, distance to and altitude above landing site.
+        landing_site_distance_north = (landing_site_latlonalt[0]-latitude())*(2*math.pi*kerbin.equatorial_radius)/360.0
+        landing_site_distance_east  = (landing_site_latlonalt[1]-longitude())*(2*math.pi*kerbin.equatorial_radius)/360.0
+        heading_to_landing_site = 180.0*math.atan2(landing_site_distance_east,landing_site_distance_north)/math.pi
+        if heading_to_landing_site < 0.0: heading_to_landing_site += 360.0
+        distance_to_landing_site = math.sqrt(landing_site_distance_north*landing_site_distance_north + landing_site_distance_east*landing_site_distance_east)
+        altitude_above_landing_site = altitude() - landing_site_latlonalt[2]
 
         # Flight modes state machine
         if state == "INIT":
@@ -90,20 +103,70 @@ if __name__ == "__main__":
             vertical_speed_control = True
             if altitude_above_launch_site < 2.0:
                 vessel.auto_pilot.target_pitch_and_heading(90,90)
-            elif altitude_above_launch_site < 10.0:
+            elif altitude_above_launch_site < 50.0:
                 vessel.control.gear = False
-                vessel.auto_pilot.target_pitch_and_heading(80,90)
+                vessel.auto_pilot.target_pitch_and_heading(90,90)
+            elif altitude_above_launch_site < 100.0:
+                vessel.auto_pilot.target_pitch_and_heading(85,90)
             else:
                 state = "ACENDING"
 
         elif state == "ACENDING":
-            #altitude_target = 1000.0
-            #altitude_control = True
-            vertical_speed_control = True
-            vertical_speed_target = 220.0
-            if altitude() > 2000.0:
-                hover_time = time_now + 20.0
-                state = "HOVER"
+            pitch = min(max(180.0*math.atan(vertical_speed/speed_east)/math.pi + 5.0,45),85)
+            vessel.auto_pilot.reference_frame = surface_frame
+            vessel.auto_pilot.target_pitch_and_heading(pitch,90)
+            #forward_speed_error = 250.0 - vessel.flight(orbit_frame).speed
+            #vessel.control.throttle = min(max(speed_pid.calculate_command(forward_speed_error,dt),0.0),1.0)
+            vessel.control.throttle = 1.0
+            if altitude() > 8000.0:
+                wait_time = time_now + 5.0
+                state = "LAUNCH_PAYLOAD"
+                ap_error_OK = 0
+
+        elif state == "LAUNCH_PAYLOAD":
+            pitch = 180.0*math.atan(vertical_speed/speed_east)/math.pi
+            vessel.auto_pilot.reference_frame = surface_frame
+            vessel.auto_pilot.target_pitch_and_heading(pitch,90)
+            vessel.control.throttle = 0.0
+            vessel.control.toggle_action_group(5)
+            if wait_time < time_now:
+                state = "BOOST-BACK-FLIP"
+
+        elif state == "BOOST-BACK-FLIP":
+            vessel.auto_pilot.reference_frame = surface_frame
+            vessel.auto_pilot.target_pitch_and_heading(0,heading_to_landing_site)
+            vessel.control.throttle = 0.0
+            ap_error = vessel.auto_pilot.error
+            if ap_error < 30.0:
+                ap_error_OK += 1
+            else:
+                ap_error_OK = 0
+            if ap_error_OK > 20:
+                state = "BOOST-BACK"
+
+
+        elif state == "BOOST-BACK":
+            # Calculate boost-back velocity
+            t = (vertical_speed + math.sqrt(vertical_speed*vertical_speed + 2*kerbin.surface_gravity*altitude_above_landing_site))/kerbin.surface_gravity
+            velocity_boostback = (1.3*distance_to_landing_site)/t + 10.0
+            heading_boostback = heading_to_landing_site
+            velocity_error_north = velocity_boostback*math.cos(math.pi*heading_boostback/180.0) - speed_north
+            velocity_error_east = velocity_boostback*math.sin(math.pi*heading_boostback/180.0) - speed_east
+            velocity_error_direction = 180.0*math.atan2(velocity_error_east, velocity_error_north)/math.pi
+            if velocity_error_direction < 0: velocity_error_direction += 360
+            velocity_error_magnitude = math.sqrt(velocity_error_north*velocity_error_north+velocity_error_east*velocity_error_east)
+
+            if velocity_error_magnitude < 10.0:
+                state = "DECENDING"
+                vessel.control.throttle = 0.0
+            else:
+                # Execute boost-back
+                ap_error = vessel.auto_pilot.error
+                vessel.auto_pilot.reference_frame = surface_frame
+                vessel.auto_pilot.target_pitch_and_heading(0,velocity_error_direction)
+                throttle_command = min(max(0.1*velocity_error_magnitude,0.0),1.0)
+                vessel.control.throttle = min(max(throttle_command-ap_error/45.0, 0.0),1.0)
+
         
         elif state == "HOVER":
             altitude_target = 3000.0
@@ -119,7 +182,7 @@ if __name__ == "__main__":
             position_control = True
             position_target = (launch_site_latitude,launch_site_longitude)
             spoiler_active = True
-            if altitude_above_launch_site < 20.0:
+            if altitude_above_landing_site < 20.0:
                 state = "FINE_TUNE_LANDING"
 
         elif state == "FINE_TUNE_LANDING":
@@ -210,7 +273,8 @@ if __name__ == "__main__":
             while heading < 0.0:
                 heading += 360.0
             while heading > 360.0:
-                heading -= 360.0 
+                heading -= 360.0
+            vessel.auto_pilot.reference_frame = surface_frame
             vessel.auto_pilot.target_pitch_and_heading(pitch,heading)
             vessel.auto_pilot.engage()
         else:
@@ -235,6 +299,7 @@ if __name__ == "__main__":
             print("Altitude SURF:         " + str(surface_altitude()))
             print("Altitude ALS:          " + str(altitude_above_launch_site))
             print("Altitude ASL target:   " + str(altitude_target)) 
+            print("speed:                 " + str(vessel.flight(orbit_frame).speed))
             print("Vertical speed:        " + str(vertical_speed))
             print("Vertical speed target: " + str(vertical_speed_target))
             print("Launcher fuel:         " + str(launcher_liquid_fuel()))
@@ -243,6 +308,7 @@ if __name__ == "__main__":
             print("Velocity:              " + str(velocity_ned))
             if horizontal_speed_control:
                 print("Horizontal speed err:  " + str(horizontal_speed_error_magnitude) + "m/s " + str(horizontal_speed_error_direction) + "deg")
+            print("Landing site: heading=" + str(heading_to_landing_site) + ", dist=" + str(distance_to_landing_site) + ", alt=" +str(altitude_above_landing_site))
 
         horizontal_speed_control = False
         vertical_speed_control = False
